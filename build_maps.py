@@ -97,17 +97,23 @@ def worker_trace_files(worker_id: int, files: list[str], out_path: str) -> None:
     root_prefix = str(SQLGLOT_ROOT) + "/"
     cur_lines: dict[str, set[int]] = defaultdict(set)
     cur_files: set[str] = set()
+    setup_files: set[str] = set()
     active = False
+    in_setup = False
 
     orig_open = builtins.open
     orig_io_open = io.open
 
     def tracked_open(file, mode="r", *args, **kwargs):
-        if active and isinstance(file, (str, os.PathLike)):
+        if (active or in_setup) and isinstance(file, (str, os.PathLike)):
             try:
                 p = os.path.abspath(os.fspath(file))
                 if p.startswith(root_prefix):
-                    cur_files.add(p[len(root_prefix):])
+                    rel_p = p[len(root_prefix):]
+                    if in_setup:
+                        setup_files.add(rel_p)
+                    else:
+                        cur_files.add(rel_p)
             except Exception:
                 pass
         return orig_open(file, mode, *args, **kwargs)
@@ -117,11 +123,15 @@ def worker_trace_files(worker_id: int, files: list[str], out_path: str) -> None:
     orig_path_open = Path.open
 
     def tracked_path_open(self, mode="r", *args, **kwargs):
-        if active:
+        if active or in_setup:
             try:
                 p = os.path.abspath(os.fspath(self))
                 if p.startswith(root_prefix):
-                    cur_files.add(p[len(root_prefix):])
+                    rel_p = p[len(root_prefix):]
+                    if in_setup:
+                        setup_files.add(rel_p)
+                    else:
+                        cur_files.add(rel_p)
             except Exception:
                 pass
         return orig_path_open(self, mode, *args, **kwargs)
@@ -142,8 +152,23 @@ def worker_trace_files(worker_id: int, files: list[str], out_path: str) -> None:
     sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.LINE, on_line)
 
     results: dict[str, dict] = {}
+    setup_results: dict[str, set[str]] = defaultdict(set)
 
     class CovPlugin:
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_runtest_setup(self, item):
+            nonlocal in_setup
+            setup_files.clear()
+            in_setup = True
+            try:
+                yield
+            finally:
+                in_setup = False
+                if setup_files:
+                    parts = item.nodeid.split("::")
+                    cls_key = "::".join(parts[:2]) if len(parts) >= 2 else parts[0]
+                    setup_results[cls_key].update(setup_files)
+
         @pytest.hookimpl(hookwrapper=True)
         def pytest_runtest_protocol(self, item, nextitem):
             nonlocal active
@@ -168,7 +193,10 @@ def worker_trace_files(worker_id: int, files: list[str], out_path: str) -> None:
         raise RuntimeError(f"worker {worker_id} pytest exit {rc}")
 
     with gzip.open(out_path, "wt", encoding="utf-8") as f:
-        json.dump(results, f)
+        json.dump({
+            "tests": results,
+            "setup_files": {k: sorted(v) for k, v in setup_results.items()},
+        }, f)
 
 
 def build_ast_maps(test_ids: list[str], line_cov: dict[str, dict[int, list[int]]]) -> dict:
@@ -275,15 +303,21 @@ def build_ast_maps(test_ids: list[str], line_cov: dict[str, dict[int, list[int]]
                         "start": s_start,
                         "end": s_end,
                     })
-                elif cls_name is not None and depth == 1:
-                    # Class-level attribute/statement
+                elif cls_name is not None:
+                    # Class-level attribute/statement at any nesting depth (Dialect -> Tokenizer/Parser/Generator)
                     targets = []
                     if isinstance(st, ast.Assign):
                         for t in st.targets:
                             if isinstance(t, ast.Name):
                                 targets.append(t.id)
-                    elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
-                        targets.append(st.target.id)
+                            elif isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
+                                targets.append(t.value.id)
+                    elif isinstance(st, ast.AnnAssign):
+                        if isinstance(st.target, ast.Name):
+                            targets.append(st.target.id)
+                    elif isinstance(st, ast.AugAssign):
+                        if isinstance(st.target, ast.Name):
+                            targets.append(st.target.id)
                     scopes.append({
                         "kind": "class_attr",
                         "cls": cls_name,
@@ -374,9 +408,17 @@ def main():
     file_cov: dict[str, set[int]] = defaultdict(set)
     file_reads: dict[str, set[int]] = defaultdict(set)
 
+    # Pre-index class prefix -> list of test indices for setup_files mapping
+    cls_to_tids: dict[str, list[int]] = defaultdict(list)
+    for nid, tidx in test_to_idx.items():
+        parts = nid.split("::")
+        cls_key = "::".join(parts[:2]) if len(parts) >= 2 else parts[0]
+        cls_to_tids[cls_key].append(tidx)
+
     for i, _ in procs:
         with gzip.open(tmp_files[i], "rt", encoding="utf-8") as f:
-            wres = json.load(f)
+            payload_w = json.load(f)
+        wres = payload_w["tests"]
         for nid, info in wres.items():
             tidx = test_to_idx[nid]
             for rel_f, lines in info["lines"].items():
@@ -386,6 +428,18 @@ def main():
                     fmap[ln].append(tidx)
             for rf in info["files"]:
                 file_reads[rf].add(tidx)
+        for cls_key, files_opened in payload_w.get("setup_files", {}).items():
+            for rf in files_opened:
+                if "tpc-h/" in rf:
+                    for tidx in cls_to_tids.get(cls_key, ()):
+                        if "tpch" in nodeids[tidx].lower():
+                            file_reads[rf].add(tidx)
+                elif "tpc-ds/" in rf:
+                    for tidx in cls_to_tids.get(cls_key, ()):
+                        if "tpcds" in nodeids[tidx].lower():
+                            file_reads[rf].add(tidx)
+                else:
+                    file_reads[rf].update(cls_to_tids.get(cls_key, ()))
         os.remove(tmp_files[i])
 
     for rel_f, fmap in line_cov.items():

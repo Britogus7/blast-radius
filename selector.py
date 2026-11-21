@@ -181,19 +181,22 @@ def is_dialect_file(rel: str) -> str | None:
 
 
 def build_dialect_family_cov(dialect_cov: dict[str, set[int]]) -> dict[str, set[int]]:
-    """Expand each dialect's coverage set to include child dialects importing it."""
+    """Expand each dialect's coverage set to include child dialects importing it
+    across dialects/, parsers/, generators/, and typing/."""
     children: dict[str, set[str]] = {d: {d} for d in dialect_cov}
-    dialects_dir = SQLGLOT_ROOT / "sqlglot" / "dialects"
-    if dialects_dir.is_dir():
-        for p in dialects_dir.glob("*.py"):
-            child = p.stem
-            if child in ("__init__", "dialect"):
-                continue
-            txt = p.read_text("utf-8", errors="ignore")
-            for m in re.finditer(r"from\s+sqlglot\.dialects\.([a-z0-9_]+)\s+import", txt):
-                parent = m.group(1)
-                if parent != "dialect":
-                    children.setdefault(parent, {parent}).add(child)
+    import_re = re.compile(r"from\s+sqlglot\.(?:dialects|parsers|generators|typing)\.([a-z0-9_]+)\s+import")
+    for sub in ("dialects", "parsers", "generators", "typing"):
+        sub_dir = SQLGLOT_ROOT / "sqlglot" / sub
+        if sub_dir.is_dir():
+            for p in sub_dir.glob("*.py"):
+                child = p.stem
+                if child in ("__init__", "dialect", "parser", "generator", "typing"):
+                    continue
+                txt = p.read_text("utf-8", errors="ignore")
+                for m in import_re.finditer(txt):
+                    parent = m.group(1)
+                    if parent not in ("dialect", "parser", "generator", "typing"):
+                        children.setdefault(parent, {parent}).add(child)
     # Transitive closure
     changed = True
     while changed:
@@ -212,6 +215,19 @@ def build_dialect_family_cov(dialect_cov: dict[str, set[int]]) -> dict[str, set[
             s.update(dialect_cov.get(k, ()))
         family_cov[parent] = s
     return family_cov
+
+
+BASE_CLASSES = {
+    "Dialect",
+    "Tokenizer",
+    "Parser",
+    "Generator",
+    "TypeAnnotator",
+    "Optimizer",
+    "Executor",
+    "Expr",
+    "Expression",
+}
 
 
 def main() -> None:
@@ -315,6 +331,15 @@ def main() -> None:
                             selected.update(all_nums)
                 continue
 
+            if rel in ("sqlglot/__init__.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py"):
+                for tid_name in (
+                    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
+                    "tests/test_dialect_imports.py::TestDialectImports::test_dialect_import_no_deadlock",
+                    "tests/test_dialect_imports.py::TestDialectImports::test_dialect_attribute_access_is_cached",
+                ):
+                    if tid_name in id_to_num:
+                        selected.add(id_to_num[tid_name])
+
             if rel not in file_scopes:
                 if rel in file_cov:
                     selected.update(file_cov[rel])
@@ -373,6 +398,7 @@ def main() -> None:
                             elif sc["kind"] in ("class_attr", "module"):
                                 targets = sc.get("targets") or []
                                 cls_name = sc.get("cls")
+                                use_cls_sym = bool(cls_name and cls_name not in BASE_CLASSES and cls_name in sym_tests)
                                 cand = set()
                                 if targets:
                                     for tgt in targets:
@@ -380,20 +406,20 @@ def main() -> None:
                                         if t_sym:
                                             if d_stem and d_stem in dialect_family_cov:
                                                 cand.update(t_sym & dialect_family_cov[d_stem])
-                                            elif cls_name and cls_name in sym_tests:
+                                            elif use_cls_sym:
                                                 cand.update(t_sym & sym_tests[cls_name])
                                             else:
                                                 cand.update(t_sym)
                                         else:
                                             if d_stem and d_stem in dialect_family_cov:
                                                 cand.update(dialect_family_cov[d_stem])
-                                            elif cls_name and cls_name in sym_tests:
+                                            elif use_cls_sym:
                                                 cand.update(sym_tests[cls_name])
-                                            elif cls_name is None:
+                                            else:
                                                 cand.update(file_cov.get(rel, set()))
                                 elif d_stem and d_stem in dialect_family_cov:
                                     cand.update(dialect_family_cov[d_stem])
-                                elif cls_name and cls_name in sym_tests:
+                                elif use_cls_sym:
                                     cand.update(sym_tests[cls_name])
                                 else:
                                     cand.update(file_cov.get(rel, set()))
