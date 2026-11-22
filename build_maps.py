@@ -40,9 +40,28 @@ TRACKED_DICT_ATTRS = (
     "TRANSFORMS",
     "TYPE_MAPPING",
     "PROPERTIES_LOCATION",
+    "EXPRESSION_PARSERS",
+    "UNARY_PARSERS",
+    "BINARY_PARSERS",
+    "BITWISE_PARSERS",
+    "RANGE_PARSERS",
+    "FACTOR_PARSERS",
+    "TERM_PARSERS",
+    "COLUMN_OPERATORS",
+    "ALTER_PARSERS",
+    "SET_PARSERS",
+    "CONSTRAINT_PARSERS",
+    "PLACEHOLDER_PARSERS",
+    "PRIMARY_PARSERS",
 )
 
-UNSAFE_EQ_BASES = {"Expr", "Expression", "Dialect", "_Dialect", "Env", "ENV"}
+UNSAFE_EQ_BASES = {"reverse_key", "Env", "ENV"}
+SAFE_CUSTOM_EQ_FQ = frozenset({
+    "sqlglot/expressions/core.py::Expr",
+    "sqlglot/expressions/core.py::Expression",
+    "sqlglot/dialects/dialect.py::Dialect",
+    "sqlglot/dialects/dialect.py::_Dialect",
+})
 
 
 def norm_dict_key(key) -> str | None:
@@ -775,7 +794,8 @@ def build_ast_maps(test_ids: list[str], line_cov: dict[str, dict[int, list[int]]
                     enum_classes[node.name] = sorted(set(members))
                 for st in node.body:
                     if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name in ("__eq__", "__ne__"):
-                        classes_with_eq_fq.add(cls_fq)
+                        if cls_fq not in SAFE_CUSTOM_EQ_FQ:
+                            classes_with_eq_fq.add(cls_fq)
 
     changed = True
     while changed:

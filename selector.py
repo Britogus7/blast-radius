@@ -33,7 +33,7 @@ SQLGLOT_ROOT = Path("/app/sqlglot").resolve()
 MAPS_PATH = Path("/app/maps/maps.pkl")
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
-MAX_VERIFY_DUR_MS = 3500
+MAX_VERIFY_DUR_MS = 7000
 HARD_WALL_BUDGET_S = 115.0
 
 TRACKED_DICT_ATTRS = frozenset({
@@ -48,7 +48,60 @@ TRACKED_DICT_ATTRS = frozenset({
     "TRANSFORMS",
     "TYPE_MAPPING",
     "PROPERTIES_LOCATION",
+    "EXPRESSION_PARSERS",
+    "UNARY_PARSERS",
+    "BINARY_PARSERS",
+    "BITWISE_PARSERS",
+    "RANGE_PARSERS",
+    "FACTOR_PARSERS",
+    "TERM_PARSERS",
+    "COLUMN_OPERATORS",
+    "ALTER_PARSERS",
+    "SET_PARSERS",
+    "CONSTRAINT_PARSERS",
+    "PLACEHOLDER_PARSERS",
+    "PRIMARY_PARSERS",
 })
+
+SAFE_HOTPATCH_SCALAR_ATTRS = frozenset({
+    "WEEK_OFFSET",
+    "HEX_LOWERCASE",
+    "CONCAT_COALESCE",
+    "CONCAT_WS_COALESCE",
+    "TYPED_DIVISION",
+    "SAFE_DIVISION",
+    "NULL_ORDERING",
+    "COPY_PARAMS_ARE_CSV",
+    "DROP_UNKNOWN_ESCAPES",
+    "NUMERIC_ESCAPES_ARE_BYTES",
+    "BYTE_STRINGS_ARE_BYTES",
+    "NESTED_COMMENTS",
+    "DASH_COMMENT_REQUIRES_BOUNDARY",
+    "COMMENTS_TERMINATE_AT_NEWLINE_ONLY",
+    "HEREDOC_TAG_IS_IDENTIFIER",
+    "STRING_ESCAPES_ALLOWED_IN_RAW_STRINGS",
+    "NUMBERS_CAN_BE_UNDERSCORE_SEPARATED",
+    "NUMBERS_CAN_HAVE_DECIMALS",
+    "IDENTIFIERS_CAN_START_WITH_DIGIT",
+    "NORMALIZE_FUNCTIONS",
+    "LOG_BASE_FIRST",
+    "INDEX_OFFSET",
+    "UNNEST_COLUMN_ONLY",
+    "ALIAS_POST_TABLESAMPLE",
+    "TABLESAMPLE_SEED_KEYWORD",
+    "LOCKING_READS_SUPPORTED",
+    "JOIN_HINTS",
+    "TABLE_HINTS",
+    "QUERY_HINTS",
+})
+SAFE_HOTPATCH_SCALAR_PREFIXES = (
+    "SUPPORTS_",
+    "ALLOW_",
+    "PREFER_",
+    "FORCE_",
+    "EXPAND_",
+    "ANNOTATE_",
+)
 
 TRIE_BACKED_ATTRS = frozenset({
     "SHOW_PARSERS",
@@ -81,6 +134,18 @@ METACLASS_CONSUMED_ATTRS = frozenset({
     "VAR_SINGLE_TOKENS",
     "SHOW_TRIE",
     "SET_TRIE",
+    "BIT_STRINGS",
+    "BYTE_STRINGS",
+    "HEX_STRINGS",
+    "NATIONAL_RAW_STRINGS",
+    "RAW_STRINGS",
+    "HEREDOC_STRINGS",
+    "UNICODE_STRINGS",
+    "NUMERIC_LITERALS",
+    "HINT_START",
+    "COMMANDS",
+    "COMMAND_PREFIX_TOKENS",
+    "TOKENS_PRECEDING_HINT",
 })
 
 EQUIV_EXCLUDED_FILES = frozenset({
@@ -272,7 +337,7 @@ def parse_patch(patch_text: str) -> list[dict]:
             cur["hunks"].append(hunk)
             old_line = old_s
             new_line = new_s
-            block_has_del = False
+            block_has_code_del = False
             in_hunk = True
             continue
         if not in_hunk or not cur["hunks"]:
@@ -283,16 +348,18 @@ def parse_patch(patch_text: str) -> list[dict]:
             h["removed_lines"].append(raw[1:])
             h["del_nums"].append(old_line)
             old_line += 1
-            block_has_del = True
+            s_del = raw[1:].strip()
+            if s_del and not s_del.startswith("#"):
+                block_has_code_del = True
         elif raw.startswith("+"):
             h["added_lines"].append(raw[1:])
-            if not block_has_del:
+            if not block_has_code_del:
                 h["add_anchors"].append(max(1, old_line))
             new_line += 1
         elif raw.startswith(" ") or raw == "":
             old_line += 1
             new_line += 1
-            block_has_del = False
+            block_has_code_del = False
 
     return files
 
@@ -656,6 +723,21 @@ class _EquivNormalizer(ast.NodeTransformer):
                 new_op = ast.Eq() if isinstance(op, (ast.Is, ast.Eq)) else ast.NotEq()
                 return ast.Compare(left=other_expr, ops=[new_op], comparators=[enum_side])
 
+        # Rule E3: x is True <-> x == True, x is False <-> x == False (strictly typed bool | None only)
+        bool_const = None
+        bool_other = None
+        if isinstance(right, ast.Constant) and type(right.value) is bool and not (isinstance(left, ast.Constant) and type(left.value) is bool):
+            bool_other, bool_const = left, right
+        elif isinstance(left, ast.Constant) and type(left.value) is bool and not (isinstance(right, ast.Constant) and type(right.value) is bool):
+            bool_other, bool_const = right, left
+        if bool_const is not None and bool_other is not None:
+            tset = _infer_expr_types(
+                bool_other, ltypes, cls_attrs, self.enum_classes, self.safe_none_eq_types, self.imp_map
+            )
+            if tset and "__UNKNOWN__" not in tset and tset.issubset({"bool", "None"}):
+                new_op = ast.Eq() if isinstance(op, (ast.Is, ast.Eq)) else ast.NotEq()
+                return ast.Compare(left=bool_other, ops=[new_op], comparators=[bool_const])
+
         return node
 
 
@@ -715,6 +797,8 @@ def _norm_ast_dict_key(k: ast.AST, enum_classes: dict[str, list[str]]) -> str | 
     if isinstance(k, ast.Attribute):
         v = k.value
         v_name = v.id if isinstance(v, ast.Name) else (v.attr if isinstance(v, ast.Attribute) else None)
+        if v_name == "Type":
+            return f"e:DType.{k.attr}"
         if v_name and v_name in enum_classes:
             return f"e:{v_name}.{k.attr}"
         return "t:" + k.attr
@@ -770,7 +854,7 @@ def try_narrow_dict_attr(
 
     added_or_removed = set(o_entries) ^ set(n_entries)
     modified = {k for k in o_entries if k in n_entries and o_entries[k] != n_entries[k]}
-    if added_or_removed and (attr in TRIE_BACKED_ATTRS or not o_entries or not n_entries):
+    if added_or_removed:
         return None
 
     changed_keys = added_or_removed | modified
@@ -1056,6 +1140,8 @@ class CommitHotPatcher:
 
         for fe in active_file_edits:
             rel = fe["rel"]
+            if rel in ("sqlglot/executor/table.py", "sqlglot/schema.py"):
+                return None
             patched_str = patched_texts.get(rel)
             orig_str = orig_texts.get(rel)
             if patched_str is None or orig_str is None:
@@ -1319,9 +1405,11 @@ class CommitHotPatcher:
                     return False
 
                 if isinstance(orig_val, dict):
+                    if attr_name != "arg_types" and attr_name not in TRACKED_DICT_ATTRS:
+                        return False
                     if not isinstance(new_val, dict):
                         return False
-                    if attr_name in ("SHOW_PARSERS", "SET_PARSERS") and orig_val.keys() != new_val.keys():
+                    if attr_name in TRACKED_DICT_ATTRS and orig_val.keys() != new_val.keys():
                         return False
                     if attr_name == "NUMERIC_ESCAPES":
                         if (orig_val.keys() & {"x", "0", "u"}) != (new_val.keys() & {"x", "0", "u"}):
@@ -1331,7 +1419,7 @@ class CommitHotPatcher:
                     orig_snap = dict(orig_val)
                     dict_updates.append((orig_val, orig_snap, new_val))
 
-                    # Propagate changed keys to MRO subclasses with spread copies
+                    # Propagate changed keys to MRO subclasses AND loaded sqlglot.* spread classes
                     changed_k = [
                         k for k in new_val
                         if k in orig_snap and (new_val[k] is not orig_snap[k] and new_val[k] != orig_snap[k])
@@ -1341,12 +1429,14 @@ class CommitHotPatcher:
 
                     seen_subs: set[int] = set()
                     q = list(container.__subclasses__())
+                    mro_sub_ids: set[int] = set()
                     while q:
                         sub = q.pop()
                         sid = id(sub)
                         if sid in seen_subs:
                             continue
                         seen_subs.add(sid)
+                        mro_sub_ids.add(sid)
                         q.extend(sub.__subclasses__())
 
                         if attr_name == "arg_types" and hasattr(sub, "required_args") and "arg_types" not in sub.__dict__:
@@ -1362,7 +1452,6 @@ class CommitHotPatcher:
                         if attr_name in sub.__dict__:
                             sub_d = sub.__dict__[attr_name]
                             if isinstance(sub_d, dict) and sub_d is not orig_val:
-                                # Only propagate into spreads of orig_snap
                                 sub_snap = dict(sub_d)
                                 sub_new = dict(sub_d)
                                 touched_sub = False
@@ -1382,6 +1471,25 @@ class CommitHotPatcher:
                                 if touched_sub:
                                     dict_updates.append((sub_d, sub_snap, sub_new))
 
+                    # Also check non-MRO spread classes (e.g., AthenaGenerator spreading TrinoGenerator)
+                    if attr_name in TRACKED_DICT_ATTRS and changed_k:
+                        for mname, mobj in list(sys.modules.items()):
+                            if mobj is None or not mname.startswith("sqlglot."):
+                                continue
+                            for cand_obj in vars(mobj).values():
+                                if isinstance(cand_obj, type) and cand_obj is not container and id(cand_obj) not in mro_sub_ids:
+                                    sub_d = cand_obj.__dict__.get(attr_name)
+                                    if isinstance(sub_d, dict) and sub_d is not orig_val:
+                                        sub_snap = dict(sub_d)
+                                        sub_new = dict(sub_d)
+                                        touched_sub = False
+                                        for k in changed_k:
+                                            if k in sub_new and sub_new[k] is orig_snap[k]:
+                                                sub_new[k] = new_val[k]
+                                                touched_sub = True
+                                        if touched_sub:
+                                            dict_updates.append((sub_d, sub_snap, sub_new))
+
                     if attr_name == "arg_types" and hasattr(container, "required_args"):
                         new_req = {k for k, v in new_val.items() if v}
                         attr_updates.append((
@@ -1393,10 +1501,11 @@ class CommitHotPatcher:
                         ))
                     continue
 
-                # Immutable scalar/tuple class attribute (e.g. WEEK_OFFSET)
-                if self.verifier.dialect_base_cls and issubclass(container, self.verifier.dialect_base_cls):
-                    if attr_name in METACLASS_CONSUMED_ATTRS:
-                        return False
+                # Strict whitelist for non-dict class attributes (blocks RAW_STRINGS, KEYWORDS, etc.)
+                if attr_name in METACLASS_CONSUMED_ATTRS:
+                    return False
+                if attr_name not in SAFE_HOTPATCH_SCALAR_ATTRS and not attr_name.startswith(SAFE_HOTPATCH_SCALAR_PREFIXES):
+                    return False
                 attr_updates.append((container, attr_name, True, orig_val, new_val))
                 continue
 
@@ -1479,15 +1588,23 @@ def main() -> None:
     dialect_family_children: dict[str, list[str]] = maps.get("dialect_family_children", {})
     enum_classes: dict[str, list[str]] = maps.get("enum_classes", {})
     enum_fq_tokens: set[str] = set()
+    expr_pkg_aliases: set[str] = set()
     for c_key in maps.get("safe_classes_fq", ()):
         bare = c_key.split("::")[-1]
         if bare in enum_classes:
             enum_fq_tokens.add(c_key)
+        if c_key.startswith("sqlglot/expressions/"):
+            expr_pkg_aliases.add(f"sqlglot/expressions::{bare}")
+            expr_pkg_aliases.add(f"sqlglot/expressions/__init__.py::{bare}")
+        if c_key.startswith("sqlglot/dialects/"):
+            expr_pkg_aliases.add(f"sqlglot/dialects::{bare}")
+            expr_pkg_aliases.add(f"sqlglot/dialects/__init__.py::{bare}")
     safe_none_eq_types: set[str] = (
         STDLIB_SAFE_NONE_EQ_TYPES
         | set(maps.get("safe_classes_fq", ()))
         | set(enum_classes.keys())
         | enum_fq_tokens
+        | expr_pkg_aliases
     )
     class_attr_types: dict[str, dict[str, set[str]]] = {
         c: {a: set(ts) for a, ts in amap.items()}
@@ -1711,6 +1828,14 @@ def main() -> None:
                                 cand = set()
                                 if targets:
                                     for tgt in targets:
+                                        if tgt in METACLASS_CONSUMED_ATTRS or tgt in TRACKED_DICT_ATTRS:
+                                            if d_stem and d_stem in dialect_family_cov:
+                                                cand.update(dialect_family_cov[d_stem])
+                                            elif use_cls_sym:
+                                                cand.update(sym_tests[cls_name])
+                                            else:
+                                                cand.update(file_cov.get(rel, set()))
+                                            continue
                                         t_sym: set[int] = set()
                                         for sym_k in TRIE_COMPANIONS.get(tgt, (tgt,)):
                                             t_sym.update(sym_tests.get(sym_k, ()))
