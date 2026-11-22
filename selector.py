@@ -1919,7 +1919,7 @@ def main() -> None:
         if ok:
             eligible_recs.append((net_val, r))
 
-    if eligible_recs:
+    if False and eligible_recs:
         eligible_recs.sort(key=lambda x: (-x[0], x[1]["idx"]))
         for _, rec in eligible_recs:
             if time.monotonic() - t0 >= HARD_WALL_BUDGET_S:
